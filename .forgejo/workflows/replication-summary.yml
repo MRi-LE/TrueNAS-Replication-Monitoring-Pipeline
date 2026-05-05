@@ -1,0 +1,100 @@
+name: Replication Daily Summary
+
+on:
+  schedule:
+    - cron: '0 8 * * *'     # every day at 08:00
+  workflow_dispatch:         # manual trigger
+
+jobs:
+  daily-summary:
+    runs-on: truenas-runner
+    steps:
+      - name: Checkout repo (to get truenas_ws.py and helper scripts)
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq python3-pip
+          python3 -m pip install websocket-client --break-system-packages
+
+      - name: Generate and send daily summary
+        env:
+          TRUENAS_HOST: ${{ secrets.TRUENAS_HOST }}
+          TRUENAS_PORT: ${{ secrets.TRUENAS_PORT }}
+          TRUENAS_API_KEY: ${{ secrets.TRUENAS_API_KEY }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          set -euo pipefail
+
+          # ── Step 1: Query TrueNAS ────────────────────────────────────────────
+          if python3 scripts/truenas_ws.py --action list-tasks > /tmp/task_states.json 2>&1; then
+            echo "TrueNAS API query succeeded."
+          else
+            EXIT_CODE=$?
+            echo "ERROR: Could not reach TrueNAS API (exit ${EXIT_CODE})"
+            cat /tmp/task_states.json
+            curl -sf \
+              -H "Title: Daily Summary Failed" \
+              -H "Priority: default" \
+              -H "Tags: warning,truenas" \
+              -d "Could not reach TrueNAS API at ${TRUENAS_HOST}:${TRUENAS_PORT} for daily summary." \
+              "${NTFY_URL}/${NTFY_TOPIC}" || true
+            exit 1
+          fi
+
+          # ── Step 2: Build summary (single parse, both outputs) ───────────────
+          # scripts/watch_summary.py reads /tmp/task_states.json once and writes
+          # /tmp/summary_result.json: {message: str, has_failed: yes|no|no_tasks}
+          if python3 scripts/watch_summary.py; then
+            echo "Summary script succeeded."
+          else
+            EXIT_CODE=$?
+            echo "ERROR: Failed to build summary (exit ${EXIT_CODE})"
+            curl -sf \
+              -H "Title: Daily Summary Failed" \
+              -H "Priority: default" \
+              -H "Tags: warning,truenas" \
+              -d "Could not build daily summary message. Check workflow logs." \
+              "${NTFY_URL}/${NTFY_TOPIC}" || true
+            exit 1
+          fi
+
+          # ── Step 3: Read outputs from result file ────────────────────────────
+          if SUMMARY=$(python3 -c "import json; print(json.load(open('/tmp/summary_result.json'))['message'])"); then
+            echo "Summary message loaded."
+          else
+            echo "ERROR: Could not read summary message from result file."
+            exit 1
+          fi
+
+          if HAS_FAILED=$(python3 -c "import json; print(json.load(open('/tmp/summary_result.json'))['has_failed'])"); then
+            echo "Failure check complete: HAS_FAILED=${HAS_FAILED}"
+          else
+            echo "WARNING: Could not read has_failed from result file -- defaulting to healthy."
+            HAS_FAILED="no"
+          fi
+
+          # ── Step 4: Set title and priority ───────────────────────────────────
+          if [ "$HAS_FAILED" = "yes" ]; then
+            PRIORITY="high"
+            TITLE="Daily Replication Summary -- Issues Detected"
+          elif [ "$HAS_FAILED" = "no_tasks" ]; then
+            PRIORITY="default"
+            TITLE="Daily Replication Summary -- No Tasks Found"
+          else
+            PRIORITY="low"
+            TITLE="Daily Replication Summary -- All Healthy"
+          fi
+
+          # ── Step 5: Send notification ─────────────────────────────────────────
+          echo "Summary:"
+          echo "$SUMMARY"
+
+          curl -sf \
+            -H "Title: ${TITLE}" \
+            -H "Priority: ${PRIORITY}" \
+            -H "Tags: bar_chart,truenas" \
+            -d "${SUMMARY}" \
+            "${NTFY_URL}/${NTFY_TOPIC}" || true
