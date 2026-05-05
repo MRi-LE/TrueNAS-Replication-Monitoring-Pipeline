@@ -35,13 +35,13 @@ replication-watch.yml  (every 15 min)
                                   ├── retry 2 incremental ──→ success → ntfy ✅
                                   ├── retry 3 incremental ──→ success → ntfy ✅
                                   │   (all 3 failed)
-                                  ├── ntfy: escalating 🚨
+                                  ├── ntfy: escalating 
                                   ├── save original policy → Forgejo variable TASK_POLICY_<id>
                                   ├── switch to full replication
                                   ├── run + poll
                                   │   ├── success → restore policy from variable → ntfy ✅
                                   │   │            delete TASK_POLICY_<id> variable
-                                  │   └── failed  → ntfy 🆘 CRITICAL + job fails red
+                                  │   └── failed  → ntfy  CRITICAL + job fails red
                                   └── delete RECOVERING_<id> (always)
 
 replication-summary.yml  (daily at 08:00)
