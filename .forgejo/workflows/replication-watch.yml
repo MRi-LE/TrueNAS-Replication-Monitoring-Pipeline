@@ -1,0 +1,103 @@
+name: Replication Monitor
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 minutes
+  workflow_dispatch:          # manual trigger
+
+# Only one monitor run at a time
+concurrency:
+  group: replication-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-replication:
+    runs-on: truenas-runner
+    steps:
+      - name: Checkout repo (to get truenas_ws.py and helper scripts)
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq python3-pip
+          python3 -m pip install websocket-client --break-system-packages
+
+      # ─────────────────────────────────────────────
+      # STEP 1 — Query TrueNAS and evaluate all tasks
+      #
+      # list-tasks emits a JSON array of task objects.
+      # Empty array [] means no tasks.
+      #
+      # scripts/watch_evaluate.py:
+      #   - parses the JSON
+      #   - skips disabled and non-failed tasks
+      #   - checks RECOVERING_<id> per task via Forgejo API
+      #   - writes /tmp/tasks_to_dispatch.json: [{id}, ...] (IDs only)
+      #
+      # All structured data stays in Python. Bash only orchestrates.
+      # ─────────────────────────────────────────────
+      - name: Query all replication tasks
+        env:
+          TRUENAS_HOST: ${{ secrets.TRUENAS_HOST }}
+          TRUENAS_PORT: ${{ secrets.TRUENAS_PORT }}
+          TRUENAS_API_KEY: ${{ secrets.TRUENAS_API_KEY }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CI_URL: ${{ secrets.CI_URL }}
+          CI_TOKEN: ${{ secrets.CI_TOKEN }}
+          CI_REPO: ${{ secrets.CI_REPO }}
+        run: |
+          set -euo pipefail
+
+          if python3 scripts/truenas_ws.py --action list-tasks > /tmp/task_states.json 2>&1; then
+            echo "TrueNAS API query succeeded."
+          else
+            EXIT_CODE=$?
+            echo "ERROR: Could not reach TrueNAS API (exit ${EXIT_CODE})"
+            cat /tmp/task_states.json
+            curl -sf \
+              -H "Title: TrueNAS API Unreachable" \
+              -H "Priority: high" \
+              -H "Tags: warning,truenas" \
+              -d "Could not reach TrueNAS API at ${TRUENAS_HOST}:${TRUENAS_PORT}. Check host, port, or API key." \
+              "${NTFY_URL}/${NTFY_TOPIC}" || true
+            exit 1
+          fi
+
+          cat /tmp/task_states.json
+
+          if python3 scripts/watch_evaluate.py; then
+            echo "Task evaluation complete."
+          else
+            EXIT_CODE=$?
+            echo "ERROR: Task evaluation failed (exit ${EXIT_CODE})"
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────────
+      # STEP 2 — Dispatch recovery for each queued task
+      #
+      # Reads /tmp/tasks_to_dispatch.json (IDs only).
+      # Task names are NOT passed — recover workflow resolves
+      # the name fresh from TrueNAS to avoid stale-name notifications.
+      #
+      # All dispatch HTTP calls stay in Python via urllib.
+      # ─────────────────────────────────────────────
+      - name: Dispatch recovery workflows
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CI_URL: ${{ secrets.CI_URL }}
+          CI_TOKEN: ${{ secrets.CI_TOKEN }}
+          CI_REPO: ${{ secrets.CI_REPO }}
+        run: |
+          set -euo pipefail
+
+          if python3 scripts/watch_dispatch.py; then
+            echo "All dispatches complete."
+          else
+            EXIT_CODE=$?
+            echo "ERROR: One or more dispatches failed (exit ${EXIT_CODE})"
+            exit 1
+          fi
